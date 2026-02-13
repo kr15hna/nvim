@@ -1,0 +1,18 @@
+### compute-input
+@script lua
+vars.host = "https://httpbin.org"
+vars.user_id = tostring(math.random(1000, 9999))
+vars.trace = os.date("run-%Y%m%d-%H%M%S")
+
+### request-with-params
+GET {{host}}/get?user_id={{user_id}}&verbose=true
+X-Trace-Id: {{trace}}
+Accept: application/json
+
+
+### post-with-dynamic-header
+POST {{host}}/anything
+Content-Type: application/json
+X-Trace-Id: {{trace}}
+
+{"user_id":"{{user_id}}","source":"nvim-http-example"}

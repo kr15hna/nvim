@@ -1,0 +1,10 @@
+### health
+GET https://httpbin.org/get
+Accept: application/json
+
+
+### create
+POST https://httpbin.org/anything
+Content-Type: application/json
+
+{"name":"nvim-http","type":"demo"}
