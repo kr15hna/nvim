@@ -34,6 +34,11 @@ local function trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+local function is_comment_line(line)
+  local v = trim(line or "")
+  return v:match("^#") ~= nil or v:match("^//") ~= nil
+end
+
 local function ensure_dir(path)
   if vim.fn.isdirectory(path) == 0 then
     vim.fn.mkdir(path, "p")
@@ -179,7 +184,7 @@ local function parse_http_request(lines)
   }
 
   local idx = 1
-  while idx <= #lines and trim(lines[idx]) == "" do
+  while idx <= #lines and (trim(lines[idx]) == "" or is_comment_line(lines[idx])) do
     idx = idx + 1
   end
 
@@ -197,6 +202,28 @@ local function parse_http_request(lines)
   req.url = url
   idx = idx + 1
 
+  local query_items = {}
+  while idx <= #lines do
+    local line = lines[idx]
+    local value = trim(line)
+    if value:match("^[%?&]") then
+      local item = value:gsub("^[%?&]+", "")
+      if item ~= "" then
+        table.insert(query_items, item)
+      end
+      idx = idx + 1
+    elseif is_comment_line(line) then
+      idx = idx + 1
+    else
+      break
+    end
+  end
+
+  if #query_items > 0 then
+    local joiner = req.url:find("?", 1, true) and "&" or "?"
+    req.url = req.url .. joiner .. table.concat(query_items, "&")
+  end
+
   while idx <= #lines do
     local line = lines[idx]
     if trim(line) == "" then
@@ -204,13 +231,17 @@ local function parse_http_request(lines)
       break
     end
 
-    local key, value = line:match("^([^:]+):%s*(.*)$")
-    if not key then
-      return nil, "invalid header line: " .. line
-    end
+    if is_comment_line(line) then
+      idx = idx + 1
+    else
+      local key, value = line:match("^([^:]+):%s*(.*)$")
+      if not key then
+        return nil, "invalid header line: " .. line
+      end
 
-    table.insert(req.headers, { key = trim(key), value = trim(value) })
-    idx = idx + 1
+      table.insert(req.headers, { key = trim(key), value = trim(value) })
+      idx = idx + 1
+    end
   end
 
   if idx <= #lines then
@@ -383,9 +414,152 @@ local function parse_curl_output(lines)
     end
   end
 
+  local function compact_json_text(input)
+    local out = {}
+    local in_string = false
+    local escaped = false
+    for i = 1, #input do
+      local ch = input:sub(i, i)
+      if in_string then
+        table.insert(out, ch)
+        if escaped then
+          escaped = false
+        elseif ch == "\\" then
+          escaped = true
+        elseif ch == "\"" then
+          in_string = false
+        end
+      elseif ch == "\"" then
+        in_string = true
+        table.insert(out, ch)
+      elseif not ch:match("%s") then
+        table.insert(out, ch)
+      end
+    end
+    return table.concat(out)
+  end
+
+  local function pretty_json_text(input)
+    local compact = compact_json_text(input)
+    local out = {}
+    local indent = 0
+    local in_string = false
+    local escaped = false
+    local indent_unit = "  "
+
+    local function append_indent(level)
+      table.insert(out, string.rep(indent_unit, math.max(level, 0)))
+    end
+
+    for i = 1, #compact do
+      local ch = compact:sub(i, i)
+      if in_string then
+        table.insert(out, ch)
+        if escaped then
+          escaped = false
+        elseif ch == "\\" then
+          escaped = true
+        elseif ch == "\"" then
+          in_string = false
+        end
+      elseif ch == "\"" then
+        in_string = true
+        table.insert(out, ch)
+      elseif ch == "{" or ch == "[" then
+        table.insert(out, ch)
+        local next_ch = compact:sub(i + 1, i + 1)
+        if not ((ch == "{" and next_ch == "}") or (ch == "[" and next_ch == "]")) then
+          indent = indent + 1
+          table.insert(out, "\n")
+          append_indent(indent)
+        end
+      elseif ch == "}" or ch == "]" then
+        local prev_ch = compact:sub(i - 1, i - 1)
+        if not ((prev_ch == "{" and ch == "}") or (prev_ch == "[" and ch == "]")) then
+          indent = math.max(indent - 1, 0)
+          table.insert(out, "\n")
+          append_indent(indent)
+        end
+        table.insert(out, ch)
+      elseif ch == "," then
+        table.insert(out, ch)
+        table.insert(out, "\n")
+        append_indent(indent)
+      elseif ch == ":" then
+        table.insert(out, ": ")
+      else
+        table.insert(out, ch)
+      end
+    end
+
+    return table.concat(out)
+  end
+
+  local function is_json_content_type(content_type)
+    local v = trim(content_type or ""):lower()
+    return v:find("application/json", 1, true) ~= nil or v:find("+json", 1, true) ~= nil
+  end
+
+  local function maybe_pretty_json_http(raw_http)
+    local out_lines = vim.split(raw_http or "", "\n", { plain = true })
+    local status_idx = nil
+    for i = 1, #out_lines do
+      if out_lines[i]:match("^HTTP/%d") then
+        status_idx = i
+      end
+    end
+    if not status_idx then
+      return raw_http
+    end
+
+    local header_end = nil
+    for i = status_idx, #out_lines do
+      if out_lines[i] == "" then
+        header_end = i
+        break
+      end
+    end
+    if not header_end then
+      return raw_http
+    end
+
+    local content_type = nil
+    for i = status_idx + 1, header_end - 1 do
+      local key, value = out_lines[i]:match("^([^:]+):%s*(.*)$")
+      if key and key:lower() == "content-type" then
+        content_type = value
+      end
+    end
+    if not is_json_content_type(content_type) then
+      return raw_http
+    end
+
+    local body = table.concat(vim.list_slice(out_lines, header_end + 1, #out_lines), "\n")
+    if trim(body) == "" then
+      return raw_http
+    end
+
+    local decoded = json_decode(body)
+    if not decoded then
+      return raw_http
+    end
+
+    local pretty_body = pretty_json_text(body)
+    if pretty_body == "" then
+      return raw_http
+    end
+
+    local merged = vim.list_slice(out_lines, 1, header_end)
+    local pretty_lines = vim.split(pretty_body, "\n", { plain = true })
+    for _, line in ipairs(pretty_lines) do
+      table.insert(merged, line)
+    end
+    return table.concat(merged, "\n")
+  end
+
   if not meta_idx then
     return {
-      raw = table.concat(cleaned, "\n"),
+      raw = maybe_pretty_json_http(table.concat(cleaned, "\n")),
       status = "unknown",
       time_total = "unknown",
     }
@@ -396,7 +570,7 @@ local function parse_curl_output(lines)
   local output = vim.list_slice(cleaned, 1, meta_idx - 1)
 
   return {
-    raw = table.concat(output, "\n"),
+    raw = maybe_pretty_json_http(table.concat(output, "\n")),
     status = status or "unknown",
     time_total = time_total or "unknown",
   }
@@ -502,24 +676,87 @@ end
 local function open_result_window(content)
   local split_dir = config.split.direction or "botright"
   local split_size = tonumber(config.split.size) or 16
+  local response_buf_name = "nvim-http://response"
+  local existing = vim.fn.bufnr(response_buf_name)
+  local win = nil
+  local buf = nil
 
-  vim.cmd(string.format("%s %dsplit", split_dir, split_size))
-  local win = vim.api.nvim_get_current_win()
-  local buf = vim.api.nvim_create_buf(false, true)
+  if existing ~= -1 and vim.api.nvim_buf_is_valid(existing) then
+    buf = existing
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.api.nvim_win_get_buf(winid) == buf then
+        win = winid
+        break
+      end
+    end
+  else
+    buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buf, response_buf_name)
+  end
+
+  if not win then
+    vim.cmd(string.format("%s %dsplit", split_dir, split_size))
+    win = vim.api.nvim_get_current_win()
+  else
+    vim.api.nvim_set_current_win(win)
+  end
 
   vim.api.nvim_win_set_buf(win, buf)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].swapfile = false
-  vim.bo[buf].modifiable = true
   vim.bo[buf].filetype = "http"
+  if vim.bo[buf].syntax == "" then
+    vim.bo[buf].syntax = "http"
+  end
+  if vim.treesitter and vim.treesitter.stop then
+    pcall(vim.treesitter.stop, buf)
+  end
 
+  vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(content, "\n", { plain = true }))
   vim.bo[buf].modifiable = false
-  vim.api.nvim_buf_set_name(buf, "nvim-http://response")
 end
 
-local function write_history(request_name, request_text, response)
+local function render_request_text(req)
+  local lines = {
+    string.format("%s %s", req.method or "", req.url or ""),
+  }
+
+  for _, header in ipairs(req.headers or {}) do
+    local key = header.key or ""
+    local value = header.value or ""
+    table.insert(lines, string.format("%s: %s", key, value))
+  end
+
+  if req.body and req.body ~= "" then
+    table.insert(lines, "")
+    append_multiline(lines, req.body)
+  end
+
+  return table.concat(lines, "\n")
+end
+
+local function render_history_text(request_name, req, response, timestamp)
+  local lines = {
+    "# nvim-http response",
+    "# request: " .. request_name,
+    "# status: " .. response.status,
+    "# time_total: " .. response.time_total,
+    "# timestamp: " .. timestamp,
+    "",
+    "## request",
+  }
+  append_multiline(lines, render_request_text(req))
+  table.insert(lines, "")
+  table.insert(lines, "## response")
+  append_multiline(lines, response.raw)
+  table.insert(lines, "")
+
+  return table.concat(lines, "\n")
+end
+
+local function write_history(request_name, req, response)
   local cwd = vim.fn.getcwd()
   local dir = cwd .. "/" .. config.history_dir
   ensure_dir(dir)
@@ -529,25 +766,12 @@ local function write_history(request_name, request_text, response)
   local uniq = tostring(uv.hrtime() % 1000000)
   local safe = sanitize_name(request_name)
   local path = string.format("%s/%s-%s-%s.http.response", dir, stamp, uniq, safe)
+  local timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local content = render_history_text(request_name, req, response, timestamp)
 
-  local lines = {
-    "# nvim-http response",
-    "# request: " .. request_name,
-    "# status: " .. response.status,
-    "# time_total: " .. response.time_total,
-    "# timestamp: " .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-    "",
-    "## request",
-  }
-  append_multiline(lines, request_text)
-  table.insert(lines, "")
-  table.insert(lines, "## response")
-  append_multiline(lines, response.raw)
-  table.insert(lines, "")
+  vim.fn.writefile(vim.split(content, "\n", { plain = true }), path)
 
-  vim.fn.writefile(lines, path)
-
-  return path
+  return path, content
 end
 
 local function run_request_async(req, cb, opts)
@@ -780,14 +1004,8 @@ local function run_sections_async(sections, done)
           response = parsed,
         }
 
-        local req_txt = table.concat(section.lines, "\n")
-        local history_path = write_history(section.name, req_txt, parsed)
-
-        table.insert(result_blocks, string.format("### %s", section.name))
-        table.insert(result_blocks, "status: " .. parsed.status .. "  time_total: " .. parsed.time_total .. "s")
-        table.insert(result_blocks, "history: " .. history_path)
-        table.insert(result_blocks, "")
-        table.insert(result_blocks, parsed.raw)
+        local _, history_content = write_history(section.name, req, parsed)
+        table.insert(result_blocks, history_content)
         table.insert(result_blocks, "")
 
         step(idx + 1)

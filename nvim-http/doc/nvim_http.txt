@@ -40,6 +40,8 @@ OAUTH CACHE
 FORMAT
   - Use `### name` to mark request/script sections.
   - Request section starts with `METHOD URL`.
+  - Optional query params can be on separate lines starting with `?` or `&`.
+  - Lines starting with `#` or `//` are treated as comments in request parsing.
   - Headers follow, then blank line, then body.
   - Script section starts with `@script lua` and runs Lua code.
 
@@ -56,4 +58,3 @@ SCRIPT CONTEXT
 HISTORY
   Responses are saved at:
     <cwd>/.nvim-http-history/<timestamp>-<unique>-<section>.http.response
-
